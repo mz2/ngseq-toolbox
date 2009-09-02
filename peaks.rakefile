@@ -1,0 +1,239 @@
+#!/usr/bin/env ruby
+require 'rubygems'
+require 'fileutils'
+require 'pp'
+
+task :default => ['peaks:make_output_directories','peaks:copy_config','peaks:call']
+
+namespace :peaks do
+  config = YAML::load(File.open('/nfs/th_group/mp4/bcl11/config.yml')).merge ENV
+
+  peaks_dir = "peaks"
+  motifs_dir = "motifs"
+  checkpoints_dir = "checkpoints"
+  bg_dir = "bg"
+  log_dir = "log"
+
+  inputf = config["input"]
+  inputf_basename = File.basename inputf, ".bed"
+  controlf = config["control"]
+  controlf_basename = File.basename controlf, ".bed"
+
+  wembl_outputf = "#{peaks_dir}/#{inputf_basename}.swembl"
+  macs_outputf = "#{peaks_dir}/#{inputf_basename}.macs"
+  swembl_outputf = "#{peaks_dir}/#{inputf_basename}.swembl"
+  macsbed_outputf = "#{peaks_dir}/#{inputf_basename}-macs.bed"
+  macsneg_outputf = "#{peaks_dir}/#{inputf_basename}-negative.macs"
+
+  around_peaks = config['peak_seq_retrieval']['around_peaks']
+  max_count = config['peak_seq_retrieval']['max_count']
+  
+  r = rand(100000)
+  peakseq_cmd_was_run = true
+  trainbg_cmd_was_run = true
+  nmica_cmd_was_run = true
+  test = config["test"]
+
+  task :clean do
+    rm_rf peaks_dir if FileTest.exist? peaks_dir
+    rm_rf motifs_dir if FileTest.exist? motifs_dir
+    rm_rf bg_dir if FileTest.exist? bg_dir
+  end
+
+  task :copy_config do
+    cp "/nfs/th_group/mp4/bcl1/config.yml", "/nfs/th_group/mp4/bcl11/log/config_#{r}.yml"
+  end
+
+  task :make_output_directories do 
+    mkdir peaks_dir unless FileTest.exist? peaks_dir
+    mkdir motifs_dir unless FileTest.exist? motifs_dir
+    mkdir checkpoints_dir unless FileTest.exist? checkpoints_dir
+    mkdir bg_dir unless FileTest.exist? bg_dir
+  end
+  
+  desc("Call peaks (with the method configured with variable 'peak_caller')")
+  task :call, :method, :needs => [:make_output_directories] do |t,args|
+    method = config["peak_calling_method"]
+    if method == "macs"
+      Rake::Task['peaks:macs'].invoke
+    elsif method == "swembl"
+      Rake::Task['peaks:swembl'].invoke
+    end
+  end
+
+  desc("Call peaks with macs")
+  task :macs => [:make_output_directories] do
+    mconfig = config['peak_calling']['macs']
+    gsize = mconfig['effective_genome_size']
+    tsize = mconfig['tag_size']
+    pvalue = mconfig['pvalue']
+    mfold = mconfig['mfold']
+    bw = mconfig['bandwidth']
+
+    if mconfig["diagnosis"]
+      diag = "--diag"
+    else
+      diag = ""
+    end
+    
+    unless uptodate? macs_outputf,inputf
+      macs_cmd = "macs --gsize #{gsize} --bw #{bw} --tsize #{tsize} --pvalue #{pvalue} --mfold=#{mfold} --treatment #{inputf} --control #{controlf} #{diag} --name #{inputf_basename}_#{r}"
+      $stderr.puts macs_cmd
+      system(macs_cmd) unless test
+
+      mv "#{inputf_basename}_#{r}_negative_peaks.xls",macsneg_outputf
+      mv "#{inputf_basename}_#{r}_peaks.xls",macs_outputf
+      mv "#{inputf_basename}_#{r}_peaks.bed",macsbed_outputf
+      rm "#{inputf_basename}_#{r}_model.r"
+    else
+      $stderr.puts "Peaks called with macs already exist"
+    end
+  end
+
+  desc("Call peaks with SWEMBL")
+  task :swembl => [:make_output_directories] do
+    sconfig = config['peak_calling']['swembl']
+    penalty_factor = sconfig['penalty_factor']
+    relbg = sconfig['relative_background']
+    fraglen = sconfig['fragment_length']
+    
+    unless uptodate? swembl_outputf, inputf
+      swembl_cmd = "SWEMBL -i #{inputf} -r #{controlf} -B -R #{relbg} -o '#{swembl_outputf}'"
+      $stderr.puts swembl_cmd
+      system(swembl_cmd) unless test
+    else
+      $stderr.puts "Peaks called with swembl already exist"
+    end
+  end
+
+  def peakseq_cmdline(inputf_basename, method, config, r, log_dir, peaks_dir)
+    rconfig = config['peak_seq_retrieval']
+    around_peaks = rconfig["around_peaks"]
+    max_count = rconfig["max_count"]
+    maskrepeats = rconfig['mask_repeats'] ? "-repeatMask" : "-noRepeatMask"
+    masktranslations = rconfig['mask_translations'] ? "-excludeTranslations" : "-noExcludeTranslations"
+    aroundpeaks = (rconfig['around_peaks'] > 0) ? "-aroundPeaks #{rconfig['around_peaks']}" : ""
+    
+    resources = "select[type==X86_64 && ncpus>=1 && mem>=5000] span[hosts=1] rusage[mem=5000]"
+#could use local sequences too but then you can't get repeats, translated sequences etc out
+#-seqDB ref/#{config['ref']}.fasta \
+    peakseq_cmd = "bsub -J'peakseq_#{r}' -R'#{resources}' -M5000000 -o'#{log_dir}/nmpeakseq_#{r}.bsub' \"nmpeakseq -database #{config['ref']} \
+-host #{config['ensembl_host']} -port #{config['ensembl_port']} \
+-user #{config['ensembl_user']} \
+-peaks #{peaks_dir}/#{inputf_basename}.#{method} \
+-inputFormat #{method} #{maskrepeats} #{masktranslations} \
+-aroundPeak #{rconfig['around_peaks']} \
+-maxLength #{rconfig['max_length']} \
+-maxCount #{rconfig['max_count']} \
+-minLength #{rconfig['min_length']} -chunkLength #{rconfig['chunk_length']} > #{peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta 2> #{log_dir}/nmpeakseq_#{inputf_basename}_#{around_peaks}around-#{max_count}top_#{r}.err\""
+    return peakseq_cmd 
+  end
+
+  desc("Retrieve peak sequences (local disk or Ensembl)")
+  task :retrieve_sequences => [:call] do |t,args|
+    method = config['peak_calling_method']
+    
+    ENV['NMICA_JVMOPTS'] = "-Xmx5000m"
+    
+    unless uptodate? "#{peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta", "#{peaks_dir}/#{inputf_basename}.#{method}"
+      peakseq_cmd_was_run = true
+      
+      peakseq_input_cmd = peakseq_cmdline(inputf_basename,method,config,r,log_dir,peaks_dir)
+      #peakseq_control_cmd = peakseq_cmdline(controlf_basename,method,config,r,log_dir,peaks_dir)
+      $stderr.puts peakseq_input_cmd
+      #$stderr.puts peakseq_control_cmd
+      system(peakseq_input_cmd) unless test
+      #system(peakseq_control_cmd) unless test
+    else
+      peakseq_cmd_was_run = false
+      $stderr.puts "Peak sequences for #{method} peak calls exist already" 
+    end
+  end
+
+  desc("Train background model from peak sequences for NMICA")
+  task :train_bg => [:retrieve_sequences] do |t,args|
+    jobdep = ""
+    if peakseq_cmd_was_run
+      jobdep = "-w'done(peakseq_#{r})'"
+    else
+      jobdep = ""
+    end
+    nconfig = config["motif_discovery"]["nmica"]
+    method = config["peak_calling_method"]
+    bgfile = "#{bg_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.bg"
+    seqfile = "#{peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta"
+    puts bgfile
+    puts seqfile
+    unless uptodate? bgfile, seqfile
+      trainbg_cmd_was_run = true
+      trainbg_cmd = "bsub -J'nmmakebg_#{inputf_basename}_#{r}' #{jobdep} -o#{log_dir}/#{bgfile}_#{r}.bout -K \"nmmakebg -classes #{nconfig['background_classes']} -order #{nconfig['background_order']} -seqs #{seqfile} -out #{bgfile} > #{log_dir}/nmmakebg_#{inputf_basename}_#{around_peaks}around-#{max_count}top.log\""
+      $stderr.puts trainbg_cmd
+      system(trainbg_cmd)
+    else
+      trainbg_cmd_was_run = false
+      $stderr.puts "Background model for #{method} peak sequences already exists" 
+    end
+  end
+
+  desc("Discover motifs from peak sequences with NMICA")
+  task :nmica => [:make_output_directories,:train_bg] do |t,args|
+    nconfig = config["motif_discovery"]["nmica"]
+    method = config["peak_calling_method"]
+    nummotifs = nconfig["num_motifs"]
+    aroundpeaks = config["peak_seq_retrieval"]["around_peaks"]
+    num_matches = config["peak_seq_retrieval"]["max_count"]
+    
+    if trainbg_cmd_was_run
+      jobdep = "-w'done(nmmakebg_#{inputf_basename}_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    prefix = "#{inputf_basename}-#{aroundpeaks}around-#{max_count}top-#{nummotifs}motifs"
+    $stderr.puts method
+    ENV['NMICA_JVMOPTS'] = "-Xmx#{nconfig['mem']}m"
+    resources = "select[type==X86_64 && ncpus>=#{nconfig['cpus']} && mem>=#{nconfig['mem']}] span[hosts=1] rusage[mem=#{nconfig['mem']}]"
+    if nconfig['mem'] > 3000
+      muchosmem = "-M'#{nconfig['mem']*1000}'" 
+    else
+      muchosmem = ""
+    end
+
+    unless uptodate? "#{motifs_dir}/#{prefix}.xms","#{peaks_dir}/#{inputf_basename}-#{method}.fasta"
+      nmica_cmd_was_run = true
+      nmica_cmd = "bsub -J'nminfer_#{inputf_basename}_#{r}' -qlong -o'#{log_dir}/nminfer-#{inputf_basename}-#{method}-#{r}.bsub' \
+-R'#{resources}' #{jobdep} #{muchosmem} \
+\"nminfer -seqs #{peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta \
+-numMotifs #{nummotifs} \
+-backgroundModel #{bg_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.bg \
+-minLength #{nconfig['min_motif_length']} -maxLength #{nconfig['max_motif_length']} \
+-threads #{nconfig['cpus']} \
+-minSeqLength 50 \
+-maxCycles 1000000 \
+-revComp \
+-expectedUsageFraction #{nconfig['expected_usage_fraction']} \
+-checkpoint #{checkpoints_dir}/#{prefix} \
+-sampleFile #{motifs_dir}/#{prefix} \
+-sampleInterval 10000 -checkpointInterval 10000 -logInterval 100 \
+-out #{motifs_dir}/#{prefix}.xms > #{log_dir}/#{prefix}.log 2> #{log_dir}/#{prefix}.err\""
+      $stderr.puts nmica_cmd
+      system(nmica_cmd)
+    else
+      nmica_cmd_was_run = false
+      $stderr.puts "Motifs for #{method} peak sequences already exist"
+    end
+  end
+
+  desc("clean up the intermediate NMICA files (checkpoints + samples)")
+  task :clean_nmica => [:nmica] do
+    if nmica_cmd_was_run
+      jobdep = "-w'done(nminfer_#{inputf_basename}_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    system("bsub -Jremove_checkpoints_#{r} -K -o/dev/null \"rm #{checkpoints_dir}/*.jos\"")
+    system("bsub -Kremove_samples_#{r} -o/dev/null \"rm #{motifs_dir}/*sample*.xms\"")
+  end
+
+end

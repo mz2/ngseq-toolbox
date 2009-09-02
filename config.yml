@@ -1,0 +1,55 @@
+#set this to true if you want to only see the commands that would be created
+test: false 
+
+#ensembl
+ref: mus_musculus_core_55_37h
+ensembl_host: ens-livemirror
+ensembl_user: ensro
+ensembl_port: 3306
+
+mapping:
+  mapping_quality_above: 10
+
+peak_calling_method: macs
+
+peak_calling:
+  macs:
+    effective_genome_size: 2500000000
+    tag_size: 54
+    pvalue: 1e-5
+    mfold: 18
+    diagnosis: true
+    bandwidth: 100
+
+  swembl:
+    fragment_length : 150
+    penalty_factor: 1.5
+    relative_background: 0.01
+
+peak_seq_retrieval:
+  around_peaks: 150 #output the sequence on either side of the peak maximum
+  mask_repeats: false
+  mask_translations: true
+  max_count: 1000
+  min_length: 20 #filter out peaks below the peak length
+  max_length: 800 #filter out peaks above the peak length
+  chunk_length: 200 #divide sequences to some max length
+
+motif_discovery:
+  nmica:
+    mem: 2000
+    cpus: 4
+    background_classes: 4
+    background_order: 1
+    expected_usage_fraction: 0.5
+    min_motif_length: 6
+    max_motif_length: 14
+    checkpoint_dir: checkpoints
+    num_motifs: 5
+
+scan_cutoff:
+  background_model: bg/41.bg
+  default_cutoff: 1.0
+
+overrep_analysis:
+  bootstraps: 100000

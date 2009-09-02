@@ -1,0 +1,352 @@
+#!/usr/bin/env ruby
+require 'yaml'
+require 'pp'
+
+config = YAML::load(File.open('/nfs/th_group/mp4/bcl11/config.yml')).merge ENV
+
+reads_path=config['reads']
+ref_db = "mus_musculus_core_55_37h"
+ref_db = config["ref"] if config["ref"]
+
+host = "ens-livemirror"
+host = config["ensembl_host"] if config["ensembl_host"]
+
+port = 3306
+port = config['ensembl_port'].to_i if config["ensembl_port"]
+
+user = "ensro"
+user = config['ensembl_user'] if config['ensembl_user']
+
+mapping_quality = config['mapping']['mapping_quality_above']
+
+test=(config['test']=="true")
+
+
+#initialise needed file paths
+if ref_db
+  ref_path = File.join "ref","#{ref_db}.fasta"
+  ref_dir = File.dirname ref_path
+  reads_dir = File.dirname reads_path
+
+  alignment_dir = "map"
+  log_dir = "log"
+
+  r = rand(1000000)
+  reads_basename=File.basename reads_path,".fastq"
+  ref_basename=File.basename ref_path,".fasta"
+  reads_sai_path=File.join reads_dir, "#{reads_basename}-#{ref_basename}.sai"
+  sam_path=File.join alignment_dir, "#{reads_basename}-#{ref_basename}.sam"
+  bam_path=File.join alignment_dir, "#{reads_basename}-#{ref_basename}.bam"
+  srt_path=File.join alignment_dir, "#{reads_basename}-#{ref_basename}.srt"
+  #rmduped_path = "#{srt_path}.rmduped.bam"
+  #rmduped_sam_path = "#{srt_path}.rmduped.sam"
+  #rmduped_bed_path = "#{srt_path}.rmduped.bed"
+  pileup_path=File.join alignment_dir,"#{reads_basename}-#{ref_basename}.srt.pileup.gz"
+
+  ENV["NMICA_JVMOPTS"] = "-Xmx4000m" #needed by nmensemblchromosomes which retrieves the chromosomes. Overkill, but just to be on the safe side... :-)
+  res_small="-R'select[type==X86_64 && mem>=3000] rusage[mem=3000]' -M3000000"
+  res="-R'select[type==X86_64 && mem>=4000] rusage[mem=4000]' -M4000000"
+  res4="-n 4 -R'select[type==X86_64 && mem>=4000] rusage[mem=4000] span[hosts=1]' -M4000000"
+  res_huge="-R'select[type==X86_64 && mem>=5000] rusage[mem=5000]' -M5000000"
+else
+  exit 1
+end
+
+task :default => ['map:sorted_sam_to_bed']
+
+#these are set to true by default (LSF job dependencies are set based on these)
+retrieve_reference_cmd_was_run = true
+ref_seq_len_cmd_was_run = true
+index_ref_cmd_was_run = true
+suffix_array_cmd_was_run = true
+align_cmd_was_run = true
+sam_to_bam_cmd_was_run = true
+sam_index_cmd_was_run = true
+sort_bam_cmd_was_run = true
+sorted_bam_to_sam_cmd = true
+rmdup_cmd_was_run = true
+sorted_bam_to_sam_cmd_was_run = true
+sorted_sam_to_bed_cmd_was_run = true
+index_sorted_bam_cmd_was_run = true
+pileup_cmd_was_run = true
+
+namespace :map do
+  desc("Create the output directories")
+  task :make_directories do
+    FileUtils.mkdir ref_dir unless FileTest.exist? ref_dir
+    FileUtils.mkdir alignment_dir unless FileTest.exist? alignment_dir
+    FileUtils.mkdir log_dir unless FileTest.exist? log_dir
+  end
+
+
+  desc("Remove (forcefully) the alignment and log directories")
+  task :clean do
+    #FileUtils.rm_rf ref_dir
+    FileUtils.rm_rf alignment_dir
+    FileUtils.rm_rf log_dir
+  end
+
+  #desc("Retrieve the reference genome from Ensembl from the specified core database (specify name of the core database with variable 'ref').")
+  task :retrieve_reference => [:make_directories] do
+
+    unless FileTest.exist? ref_path
+      retrieve_reference_cmd_was_run = true
+      retrieve_reference_cmd = "bsub -J'retrieve_ref_#{r}' #{res} -qlong -o'#{log_dir}/retrieve_ref_#{r}.bsub' \"nmensemblchromosomes -host #{host} -port #{port} -user #{user} -database #{ref_db} -out #{ref_path}\""
+      $stderr.puts retrieve_reference_cmd
+      system(retrieve_reference_cmd) unless test
+    else
+      retrieve_reference_cmd_was_run = false
+      $stderr.puts "Reference sequence has already been retrieved."
+    end
+  end
+
+  task :calc_ref_seq_lengths => [:retrieve_reference] do
+    unless uptodate? "#{ref_dir}/#{ref_basename}.len", ref_path
+      ref_seq_len_cmd_was_run = true
+      len_cmd = "bsub -J'ref_seq_len_#{r}' -R'select[type==X86_64 && mem>=7000] rusage[mem=7000]' -M7000000 -o #{log_dir}/#{ref_basename}-len.bsub \"fastalen #{ref_path} > #{ref_dir}/#{ref_basename}.len\""
+      $stderr.puts len_cmd
+      system(len_cmd) unless test
+    else
+      ref_seq_len_cmd_was_run = false
+      $stderr.puts "Reference sequence lengths have already been calculated"
+    end
+  end
+
+  desc("Create a BWA index of the reference sequence. The method used is bwtsw which will only work well with large genomes.")
+  task :index_reference => [:retrieve_reference] do
+    if retrieve_reference_cmd_was_run
+      jobdep = "-w'done(retrieve_ref_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    unless uptodate? "#{ref_path}.rsa",ref_path
+      index_ref_cmd_was_run = true
+      index_ref_cmd = "bsub -J'index_ref_#{r}' #{jobdep} #{res} -o'#{log_dir}/index_ref.bsub' \"bwa index -a bwtsw #{ref_path} > #{log_dir}/index_ref_#{r}.log\""
+      $stderr.puts index_ref_cmd
+      system(index_ref_cmd) unless test
+    else
+      index_ref_cmd_was_run = false
+      $stderr.puts "BWA index of the reference sequences already exists."
+    end
+  end
+
+  desc("Create the suffix array index of the reads against the reference")
+  task :suffix_array_index => [:index_reference] do
+    if index_ref_cmd_was_run
+      jobdep = "-w'done(index_ref_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    unless uptodate? reads_sai_path,"#{reads_path}.rsa"
+      suffix_array_cmd_was_run = true
+      suffix_array_cmd = "bsub -J'aln_#{r}' #{jobdep} #{res4} -o'#{log_dir}/aln_#{r}.bsub' \"bwa aln -t 4 #{ref_path} #{reads_path} > #{reads_sai_path} 2> #{log_dir}/suffix_array_#{r}.err\""
+      $stderr.puts suffix_array_cmd
+      system(suffix_array_cmd) unless test
+    else
+      suffix_array_cmd_was_run = false
+      $stderr.puts "Suffix array index of the reads against the reference already exists."
+    end
+  end 
+
+  desc("Align the reference sequence against the (single-ended) reads (produces SAM output)")
+  task :align => [:index_reference, :suffix_array_index, :calc_ref_seq_lengths] do
+    if suffix_array_cmd_was_run
+      jobdep = "-w'done(aln_#{r}"
+    else
+      jobdep = ""
+    end
+
+    if ref_seq_len_cmd_was_run
+      if jobdep == ""
+        jobdep = "-w'done(ref_seq_len_#{r}"
+      else
+        jobdep += "&&done(ref_seq_len_#{r}"
+      end
+    end
+
+    if jobdep != "" and (ref_seq_len_cmd_was_run or suffix_array_cmd_was_run)
+      jobdep += ")'"
+    end
+
+    unless uptodate? sam_path, reads_sai_path
+      align_cmd_was_run = true
+      align_cmd = "bsub -J'samse_#{r}' #{jobdep} #{res_huge} -o'#{log_dir}/samse_#{r}.bsub' \"bwa samse #{ref_path} #{reads_sai_path} #{reads_path} | ngfiltermap -mappingQualityAbove #{mapping_quality} -refLengths #{ref_dir}/#{ref_basename}.len -out #{sam_path} 2> #{log_dir}/align_#{r}.err\""
+      $stdout.puts align_cmd
+      system(align_cmd) unless test
+    else
+      align_cmd_was_run = false
+      $stderr.puts "SAM formatted map of the reads against the reference already exists."
+    end
+  end
+
+  desc("Create the samtools index for the reference")
+  task :sam_index do
+    unless uptodate? "#{ref_path}.fai",ref_path
+      sam_index_cmd_was_run = true
+      sam_index_cmd = "bsub -J'sam_index_ref_#{r}' -o'#{log_dir}/sam_index_ref_#{r}.bsub' \"samtools faidx #{ref_path} > #{log_dir}/sam_index_#{r}.log\""
+      $stdout.puts sam_index_cmd
+      system(sam_index_cmd) unless test
+    else
+      sam_index_cmd_was_run = false
+      $stderr.puts "The samtools index already exists."
+    end
+  end
+
+  desc("Convert the SAM mapping output to BAM (BAM,i.e. the binary format needed for sorting, aligning etc)")
+  task :sam_to_bam => [:sam_index,:align] do
+    jobdep = ""
+    if align_cmd_was_run
+      jobdep += "-w'done(samse_#{r})"
+    end
+    if sam_index_cmd_was_run
+      if (jobdep != "")
+        jobdep += "&&done(sam_index_ref_#{r})" #add to existing jobdep
+      else
+        jobdep = "-w'done(sam_index_ref_#{r})" #set the jobdep from scratch (just sam_index_ref_#{r} has been run)
+      end
+    end
+    if jobdep != ""
+      jobdep+="'" #close the single quote if any jobdeps were added
+    end
+
+    unless uptodate? bam_path, sam_path
+      sam_to_bam_cmd_was_run = true
+      sam_to_bam_cmd = "bsub -J'sam_to_bam_#{r}' #{jobdep} -o'#{log_dir}/sam_to_bam_#{r}.bsub' \"samtools view -S -b -t #{ref_path}.fai #{sam_path} > #{bam_path} 2> #{log_dir}/sam_to_bam_#{r}.err\""
+      $stderr.puts sam_to_bam_cmd
+      system(sam_to_bam_cmd) unless test
+    else
+      sam_to_bam_cmd_was_run = false
+      $stderr.puts "BAM formatted alignment already exists."
+    end
+  end
+
+  desc("Sort the BAM output and remove duplicates (ascending start coordinate along the reference sequence)")
+  task :sort_bam => [:sam_to_bam] do
+    if sam_to_bam_cmd_was_run
+      jobdep = "-w'done(sam_to_bam_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    unless uptodate? "#{srt_path}.bam",bam_path
+      sort_bam_cmd_was_run = true
+      sort_bam_cmd = "bsub -J'sort_bam_#{r}' #{jobdep} -o'#{log_dir}/sort_bam_#{r}.bsub' \"samtools sort #{bam_path} #{srt_path}_normdup > #{log_dir}/sort_bam_#{r}.log; samtools rmdup #{srt_path}_normdup.bam #{srt_path}.bam; rm #{srt_path}_normdup.bam\""
+      $stderr.puts sort_bam_cmd
+      system(sort_bam_cmd) unless test
+    else
+      sort_bam_cmd_was_run = false
+      $stderr.puts "Sorted BAM map of the reads already exists."
+    end
+  end
+
+  #shouldn't use this for ChIP-seq reads!
+  #desc("Remove duplicate reads from the sorted BAM file")
+  task :rmdup => [:sort_bam] do
+    if sort_bam_cmd_was_run
+      jobdep = "-w'done(sort_bam_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    unless uptodate? rmduped_path,"#{srt_path}.bam"
+      rmdup_cmd_was_run = true
+      rmdup_cmd = "bsub -J'rmdup_#{r}' #{jobdep} -o'#{log_dir}/rmdup_bam_#{r}.bsub' \"samtools rmdup #{srt_path}.bam #{rmduped_path}\""
+      $stderr.puts rmdup_cmd
+      system(rmdup_cmd) unless test
+    else
+      rmdup_cmd_was_run = false
+      $stderr.puts "Sorted & rmduped BAM map already exists."
+    end
+  end
+
+  desc("Convert the sorted BAM file to SAM")
+  task :sorted_bam_to_sam => [:sort_bam] do
+    if rmdup_cmd_was_run
+      jobdep = "-w'done(sort_bam_#{r})'"
+    else
+      jobdep = ""
+    end
+    unless uptodate? "#{srt_path}.sam", "#{srt_path}.bam"
+      sorted_bam_to_sam_cmd_was_run = true
+      sorted_bam_to_sam_cmd = "bsub -J'sorted_bam_to_sam_#{r}' #{jobdep} -o'#{log_dir}/sorted_bam_to_sam_#{r}.bsub' \"samtools view #{srt_path}.bam > #{srt_path}.sam 2> #{log_dir}/sorted_bam_to_sam_#{r}.log\""
+      $stderr.puts sorted_bam_to_sam_cmd
+      system(sorted_bam_to_sam_cmd) unless test
+    else
+      sorted_bam_to_sam_cmd_was_run = false
+      $stderr.puts "Sorted SAM formatted map already exists."
+    end
+  end
+
+  desc("Convert the sorted SAM file to BED")
+  task :sorted_sam_to_bed => ['map:sorted_bam_to_sam'] do
+    if sorted_bam_to_sam_cmd_was_run
+      jobdep = "-w'done(sorted_bam_to_sam_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    unless uptodate? "#{srt_path}.bed","#{srt_path}.sam"
+      sorted_sam_to_bed_cmd_was_run = true
+      sorted_sam_to_bed_cmd = "bsub -J'sorted_sam_to_bed_#{r}' #{jobdep} -o'#{log_dir}/sorted_sam_to_bed_#{r}.bsub' \"sam2bed #{srt_path}.sam > #{srt_path}.bed 2> #{log_dir}/sorted_sam_to_bed_#{r}.log\""
+      $stderr.puts sorted_sam_to_bed_cmd
+      system(sorted_sam_to_bed_cmd) unless test
+    else
+      sorted_sam_to_bed_cmd_was_run = false
+    end
+  end
+
+  desc("Index the sorted BAM file and output the read counts")
+  task :index_sorted_bam => [:sorted_bam_to_sam] do
+
+    if sort_bam_cmd_was_run 
+      jobdep = "-w'done(sort_bam_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    inputf = "#{srt_path}.bam"
+    outputf= "#{inputf}.index"
+    logf = "#{log_dir}/index_sorted_bam_#{r}.log"
+    unless uptodate? outputf, inputf
+      index_sorted_bam_cmd_was_run = true
+      index_sorted_bam_cmd = "bsub -J'index_sorted_bam_#{r}' #{jobdep} #{res} -o'#{log_dir}/index_sorted_bam_#{r}.bsub' \"samtools index #{inputf} #{outputf} > #{logf};ngcount -refLengths ref/#{ref_basename}.len -index #{outputf} -map #{inputf} > #{srt_path}.count\"; "
+      $stderr.puts index_sorted_bam_cmd
+      system(index_sorted_bam_cmd) unless test
+    else
+      index_sorted_bam_cmd_was_run = false
+      $stderr.puts "Index for a sorted BAM formatted map already exists."
+    end
+  end
+
+  desc("Output a gzipped pileup of the mapped reads")
+  task :pileup => [:index_sorted_bam] do 
+    if index_sorted_bam_cmd_was_run
+      jobdep = "-w'done(index_sorted_bam_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    unless uptodate? pileup_path, "#{srt_path}.bam"
+      pileup_cmd_was_run = true
+      pileup_cmd = "bsub -J'pileup_#{r}' #{jobdep} -o'#{log_dir}/pileup_#{r}.bsub' \"samtools pileup -cf #{ref_path} #{srt_path}.bam | gzip > #{pileup_path}\""
+      $stderr.puts pileup_cmd
+      system(pileup_cmd) unless test
+    else
+      pileup_cmd_was_run = false
+      $stderr.puts "Pileup file already exists for the map."
+    end
+  end
+
+  desc("Export the sorted, indexed BAM data to a pileup DAS data source")
+  task :to_das_data => [:index_sorted_bam] do 
+    unless uptodate? "#{srt_path}.daspileup","#{srt_path}.sam"
+      daspileup_cmd_was_run = true
+      daspileup_cmd = "ngsamprocessor -format pileup -out #{srt_path}.daspileup" 
+    else
+      daspileup_cmd_was_run = false
+      $stderr.puts "DAS pileup data file already exists"
+    end
+  end
+end
