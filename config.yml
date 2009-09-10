@@ -7,33 +7,48 @@ ensembl_host: ens-livemirror
 ensembl_user: ensro
 ensembl_port: 3306
 
+pileup_das_track:
+  host: ens-research
+  user: ensadmin
+  password: ensembl
+  port: 3306
+  database_name_prefix: mp4_pileup
+  window_frequency: 1
+  extended_length: 200
+
 mapping:
   mapping_quality_above: 10
 
-peak_calling_method: macs
+peak_calling_method: swembl
 
 peak_calling:
   macs:
     effective_genome_size: 2500000000
     tag_size: 54
-    pvalue: 1e-5
+    pvalue: 1e-6
     mfold: 18
-    diagnosis: true
+    diagnosis: false
     bandwidth: 100
+    nomodel: false
+    shiftsize: 80
 
   swembl:
-    fragment_length : 150
+    fragment_length : 200
     penalty_factor: 1.5
-    relative_background: 0.01
+    relative_background: 0.005
 
 peak_seq_retrieval:
-  around_peaks: 150 #output the sequence on either side of the peak maximum
+  around_peaks: 200 #output the sequence on either side of the peak maximum
   mask_repeats: false
   mask_translations: true
   max_count: 1000
   min_length: 20 #filter out peaks below the peak length
   max_length: 800 #filter out peaks above the peak length
   chunk_length: 200 #divide sequences to some max length
+
+tss_seq_retrieval:
+  upstream_nukes: 1000
+  downstream_nukes: 1000
 
 motif_discovery:
   nmica:
@@ -45,7 +60,7 @@ motif_discovery:
     min_motif_length: 6
     max_motif_length: 14
     checkpoint_dir: checkpoints
-    num_motifs: 5
+    num_motifs: 8
 
 scan_cutoff:
   background_model: bg/41.bg

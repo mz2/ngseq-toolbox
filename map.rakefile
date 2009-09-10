@@ -44,6 +44,7 @@ if ref_db
   pileup_path=File.join alignment_dir,"#{reads_basename}-#{ref_basename}.srt.pileup.gz"
 
   ENV["NMICA_JVMOPTS"] = "-Xmx4000m" #needed by nmensemblchromosomes which retrieves the chromosomes. Overkill, but just to be on the safe side... :-)
+  res_tiny="-R'select[type==X86_64 && mem>=2000] rusage[mem=2000]'"
   res_small="-R'select[type==X86_64 && mem>=3000] rusage[mem=3000]' -M3000000"
   res="-R'select[type==X86_64 && mem>=4000] rusage[mem=4000]' -M4000000"
   res4="-n 4 -R'select[type==X86_64 && mem>=4000] rusage[mem=4000] span[hosts=1]' -M4000000"
@@ -69,6 +70,7 @@ sorted_bam_to_sam_cmd_was_run = true
 sorted_sam_to_bed_cmd_was_run = true
 index_sorted_bam_cmd_was_run = true
 pileup_cmd_was_run = true
+daspileup_cmd_was_run = true
 
 namespace :map do
   desc("Create the output directories")
@@ -229,7 +231,8 @@ namespace :map do
     else
       jobdep = ""
     end
-
+    
+    $stderr.puts "Looking for #{srt_path}.bam"
     unless uptodate? "#{srt_path}.bam",bam_path
       sort_bam_cmd_was_run = true
       sort_bam_cmd = "bsub -J'sort_bam_#{r}' #{jobdep} -o'#{log_dir}/sort_bam_#{r}.bsub' \"samtools sort #{bam_path} #{srt_path}_normdup > #{log_dir}/sort_bam_#{r}.log; samtools rmdup #{srt_path}_normdup.bam #{srt_path}.bam; rm #{srt_path}_normdup.bam\""
@@ -263,7 +266,7 @@ namespace :map do
 
   desc("Convert the sorted BAM file to SAM")
   task :sorted_bam_to_sam => [:sort_bam] do
-    if rmdup_cmd_was_run
+    if sort_bam_cmd_was_run
       jobdep = "-w'done(sort_bam_#{r})'"
     else
       jobdep = ""
@@ -293,6 +296,7 @@ namespace :map do
       $stderr.puts sorted_sam_to_bed_cmd
       system(sorted_sam_to_bed_cmd) unless test
     else
+      $stderr.puts "Sorted BED formatted map already exists."
       sorted_sam_to_bed_cmd_was_run = false
     end
   end
@@ -339,11 +343,24 @@ namespace :map do
     end
   end
 
-  desc("Export the sorted, indexed BAM data to a pileup DAS data source")
-  task :to_das_data => [:index_sorted_bam] do 
+  desc("Export the sorted, indexed BAM data to a pileup database used in a DAS data source")
+  task :pileup_das_database => [:index_sorted_bam] do
+    if index_sorted_bam_cmd_was_run
+      jobdep = "-w'done(index_sorted_bam_#{r})'"
+    else
+      jobdep = ""
+    end
+
+    #task :pileup_das_database do
+    dasconfig = config["pileup_das_track"]
     unless uptodate? "#{srt_path}.daspileup","#{srt_path}.sam"
       daspileup_cmd_was_run = true
-      daspileup_cmd = "ngsamprocessor -format pileup -out #{srt_path}.daspileup" 
+      ref_seq_count = `wc -l ref/#{ref_basename}.len | cut -f 1 -d ' '`.to_i
+      mkdepthdb_cmd = "ngmkdepthdb -database #{dasconfig['database_name_prefix']}_#{reads_basename} -dropDatabase -createDatabase -host ens-research -user ensadmin -password ensembl -format mysql -refLengths ref/#{ref_basename}.len"  
+      sh mkdepthdb_cmd 
+      ENV["NMICA_EXTRA_JVMOPTS"] = "-Xmx2000m"
+      daspileup_cmd = "bsub -qlong -o'log/daspileup-#{r}_%J-%I.bsub' #{res_tiny} -J'daspileup-#{r}-[1-#{ref_seq_count}]%8' #{jobdep} \"ngdepth -windowFreq #{dasconfig['window_frequency']} -extendTo #{dasconfig['extended_length']} -host '#{dasconfig['host']}' -user #{dasconfig['user']} -password #{dasconfig['password']} -database #{dasconfig['database_name_prefix']}_#{reads_basename} -index #{srt_path}.bam.index -readCounts #{srt_path}.count -format mysql -refLengths ref/#{ref_basename}.len -map #{srt_path}.bam\""
+      sh daspileup_cmd
     else
       daspileup_cmd_was_run = false
       $stderr.puts "DAS pileup data file already exists"
