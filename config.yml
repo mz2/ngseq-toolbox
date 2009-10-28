@@ -16,17 +16,25 @@ pileup_das_track:
   window_frequency: 1
   extended_length: 200
 
+conservation_score_track:
+  host: ens-research
+  user: ensadmin
+  password: ensembl
+  port: 3306
+  database_name: mp4_ncbim37_phastcons_v
+  input_data_prefix: /nfs/th_group/mp4/phastcons/vertebrate/
+
 mapping:
   mapping_quality_above: 10
 
-peak_calling_method: swembl
+peak_calling_method: macs
 
 peak_calling:
   macs:
     effective_genome_size: 2500000000
     tag_size: 54
-    pvalue: 1e-6
-    mfold: 18
+    pvalue: 1e-5 #default
+    mfold: 20
     diagnosis: false
     bandwidth: 100
     nomodel: false
@@ -35,20 +43,24 @@ peak_calling:
   swembl:
     fragment_length : 200
     penalty_factor: 1.5
-    relative_background: 0.005
+    relative_background: 0.05
 
 peak_seq_retrieval:
   around_peaks: 200 #output the sequence on either side of the peak maximum
-  mask_repeats: false
+  mask_repeats: true
   mask_translations: true
   max_count: 1000
   min_length: 20 #filter out peaks below the peak length
   max_length: 800 #filter out peaks above the peak length
-  chunk_length: 200 #divide sequences to some max length
+  max_distance_from_gene: 2000
+  min_non_n: 50
+  ignore_xrefless: true
+
+  #chunk_length: 200 #divide sequences to some max length
 
 tss_seq_retrieval:
-  upstream_nukes: 1000
-  downstream_nukes: 1000
+  upstream_nukes: 1500
+  downstream_nukes: 1500
 
 motif_discovery:
   nmica:
@@ -68,3 +80,5 @@ scan_cutoff:
 
 overrep_analysis:
   bootstraps: 100000
+
+

@@ -15,7 +15,7 @@ namespace :peaks do
   @bg_dir = "bg"
   @log_dir = "log"
   @logcopy_dir = "/nfs/th_group/mp4/bcl11/log"
- 
+
   def method
     @config["peak_calling_method"]
   end
@@ -23,35 +23,104 @@ namespace :peaks do
   def ref_file
     "ref/#{@config['ref']}.fasta"
   end
+  
+  def ref_basename
+    File.basename ref_file,".fasta"
+  end
+   
+  def ref_seq_count
+    `wc -l ref/#{ref_basename}.len | cut -f 1 -d ' '`.to_i
+  end
 
   def inputf
-    @config["input"]
+    inf = @config["input"]
+    
+    if inf == nil
+      raise "No input file specified"
+    end
+    unless File.exist? inf
+      raise "Input file %s doesn't exist" % [inf]
+    end
+
+    inf
   end
   
   def inputf_basename
     File.basename inputf, ".bed"
   end
-  
-  controlf = config["control"]
-  controlf_basename = File.basename controlf, ".bed"
-  
+ 
+  def controlf
+    cf = @config["control"]
+
+    if cf == nil
+      raise "No control file specified"
+    end
+
+    unless File.exist? cf
+      raise "Control file %s doesn't exist" % [cf]
+    end
+
+    cf
+  end
+
+  def controlf_basename
+    File.basename(File.basename(controlf, ".bed"),".sam")
+  end
+
   def macs_outputf
     mfold = @config["peak_calling"]["macs"]["mfold"]
     nomodel = @config["peak_calling"]["macs"]["nomodel"]
     bandwidth = @config["peak_calling"]["macs"]["bandwidth"]
     shiftsize = @config["peak_calling"]["macs"]["shiftsize"]
     
-    "#{@peaks_dir}/#{inputf_basename}-#{mfold}mfold-#{nomodel ? 'nomodel' : 'model'}-#{bandwidth}bw-#{shiftsize}shift.macs"
+    "#{@peaks_dir}/#{inputf_basename}_control-#{controlf_basename}_#{mfold}mfold-#{nomodel ? 'nomodel' : 'model'}-#{bandwidth}bw-#{shiftsize}shift.macs"
   end
   
+  def swembl_outputf
+    sconfig = @config['peak_calling']['swembl']
+    penalty_factor = sconfig['penalty_factor']
+    relbg = sconfig['relative_background']
+    fraglen = sconfig['fragment_length']
+    
+    "#{@peaks_dir}/#{inputf_basename}_control-#{controlf_basename}_#{penalty_factor}penalty-#{fraglen}fraglen-#{relbg}relbg.swembl"
+  end
+
   def peaks_outputf 
     if method == "macs"
       macs_outputf    
     else
-      "#{@peaks_dir}/#{inputf_basename}.swembl"
+      swembl_outputf
     end
   end
+
+  def peaks_gff_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}.gff"
+  end
+
+  def peaks_html_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}.html" 
+  end
+
+  def peaks_close_to_genes_gff_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}-genes-closeby.gff"  
+  end
   
+  def peaks_close_to_genes_html_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}-genes-closeby.html"
+  end
+
+  def peaks_seq_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta"
+  end
+    
+  def peaks_seq_with_closeby_genes_gff_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top-closeby-genes.gff"
+  end
+
+  def peaks_seq_with_closeby_genes_fasta_file
+    "#{@peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top-closeby-genes.fasta"
+  end
+
   def macsbed_outputf 
     "#{@peaks_dir}/#{inputf_basename}-macs.bed"
   end
@@ -131,7 +200,7 @@ namespace :peaks do
     end
     
     unless uptodate? macs_outputf,inputf
-      macs_cmd = "macs --gsize #{gsize} --bw #{bw} --tsize #{tsize} --pvalue #{pvalue} --treatment #{inputf} #{nomodelstr} #{shiftsizestr} --control #{controlf} #{diag} --name #{inputf_basename}_#{r}"
+      macs_cmd = "bsub -I \"macs --format SAM --gsize #{gsize} --bw #{bw} --tsize #{tsize} --pvalue #{pvalue} --treatment #{inputf} #{nomodelstr} #{shiftsizestr} --control #{controlf} #{diag} --name #{inputf_basename}_#{r}\" > #{@log_dir}/#{inputf_basename}_#{r}.log 2> #{@log_dir}/#{inputf_basename}_#{r}.err"
       $stderr.puts macs_cmd
       system(macs_cmd) unless test
 
@@ -150,13 +219,13 @@ namespace :peaks do
     penalty_factor = sconfig['penalty_factor']
     relbg = sconfig['relative_background']
     fraglen = sconfig['fragment_length']
+    swembl_basename = "#{File.basename(swembl_outputf,'.swembl')}"
     
     unless uptodate? swembl_outputf, inputf
-      swembl_cmd = "SWEMBL -B -i #{inputf} -r #{controlf} -f #{fraglen} -R #{relbg} -o '#{swembl_outputf}'"
-      $stderr.puts swembl_cmd
-      system(swembl_cmd) unless test
+      swembl_cmd = "bsub -K -J'#{swembl_basename}' -olog/#{swembl_basename}.bsub \"SWEMBL -S -i #{inputf} -r #{controlf} -f #{fraglen} -R #{relbg} -x #{penalty_factor} -o '#{swembl_outputf}'\""
+      sh swembl_cmd
     else
-      $stderr.puts "Peaks called with swembl already exist"
+      $stderr.puts "Peaks called with swembl already exist (%s)" % [swembl_outputf]
     end
   end
 
@@ -167,21 +236,42 @@ namespace :peaks do
     maskrepeats = rconfig['mask_repeats'] ? "-repeatMask" : "-noRepeatMask"
     masktranslations = rconfig['mask_translations'] ? "-excludeTranslations" : "-noExcludeTranslations"
     aroundpeaks = (rconfig['around_peaks'] > 0) ? "-aroundPeaks #{rconfig['around_peaks']}" : ""
-    
-    resources = "select[type==X86_64 && ncpus>=1 && mem>=5000] span[hosts=1] rusage[mem=5000]"
-#could use local sequences too but then you can't get repeats, translated sequences etc out
-#-seqDB ref/#{config['ref']}.fasta \
-    peakseq_cmd = "ngpeak2gff -format #{method} -peaks #{@peaks_dir}/#{inputf_basename}.#{method} > #{@peaks_dir}/#{inputf_basename}-#{method}.gff;\
-cat #{@peaks_dir}/#{inputf_basename}-#{method}.gff | gffaddensemblurl Mus_musculus > #{@peaks_dir}/#{inputf_basename}-#{method}.html; \
-bsub -J'peakseq_#{r}' -R'#{resources}' -M5000000 -o'#{@log_dir}/nmpeakseq_#{r}.bsub' \"nmpeakseq -database #{config['ref']} \
+    ignore_xrefless = rconfig["ignore_xrefless"]
+
+    peakseq_cmd = "echo 'Converting peak sequences from input peak format to GFF';bsub -I \"ngpeak2gff -format #{method} -peaks #{peaks_outputf} > #{peaks_gff_file};\
+cat #{peaks_gff_file} | gffaddensemblurl Mus_musculus > #{peaks_html_file};\"\
+echo 'Retrieving peak sequences as FASTA';bsub -I \"nmensemblpeakseq -database #{config['ref']} \
 -host #{config['ensembl_host']} -port #{config['ensembl_port']} \
 -user #{config['ensembl_user']} \
--peaks #{@peaks_dir}/#{inputf_basename}.#{method} \
+-peaks #{peaks_outputf} \
 -inputFormat #{method} #{maskrepeats} #{masktranslations} \
 -aroundPeak #{rconfig['around_peaks']} \
 -maxLength #{rconfig['max_length']} \
 -maxCount #{rconfig['max_count']} \
--minLength #{rconfig['min_length']} -chunkLength #{rconfig['chunk_length']} > #{@peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta 2> #{@log_dir}/nmpeakseq_#{inputf_basename}_#{around_peaks}around-#{max_count}top_#{r}.err;\""
+-minNonN #{rconfig['min_non_n']} \
+-minLength #{rconfig['min_length']} \
+-maxDistanceFromGene #{rconfig['max_distance_from_gene']} \
+> #{peaks_seq_file} 2> #{@log_dir}/nmensemblpeakseq_#{inputf_basename}_#{around_peaks}around-#{max_count}top_#{r}.err;\";\
+echo 'Retrieving peak sequences as GFF for those peaks with closeby genes';bsub -i \"nmensemblpeakseq -database #{config['ref']} \
+-host #{config['ensembl_host']} -port #{config['ensembl_port']} \
+-user #{config['ensembl_user']} \
+-peaks #{peaks_outputf} \
+-inputformat #{method} #{maskrepeats} #{masktranslations} \
+-aroundpeak #{rconfig['around_peaks']} \
+-maxlength #{rconfig['max_length']} \
+-maxcount #{rconfig['max_count']} \
+-minnonn #{rconfig['min_non_n']} \
+-minlength #{rconfig['min_length']} \
+-maxdistancefromgene #{rconfig['max_distance_from_gene']} \
+-ignorexrefless \
+-excludeunlabelled \
+-outputformat gff \
+> #{peaks_seq_with_closeby_genes_gff_file} 2> #{@log_dir}/nmensemblpeakseq_#{inputf_basename}_#{around_peaks}around-closeby-genes-#{max_count}top_#{r}.err;\";\
+ echo 'Retrieving peak sequences as FASTA for those peaks with closeby genes';bsub -I \"nmensemblfeat -database #{config['ref']} \
+-host #{config['ensembl_host']} -port #{config['ensembl_port']} \
+-user #{config['ensembl_user']} \
+-features #{peaks_outputf} \
+> #{peaks_seq_with_closeby_genes_fasta_file} 2> #{@log_dir}/nmensemblpeakseq_#{inputf_basename}_#{around_peaks}around-closeby-genes-#{max_count}top_#{r}-fasta.err;\""
     return peakseq_cmd 
   end
 
@@ -191,18 +281,24 @@ bsub -J'peakseq_#{r}' -R'#{resources}' -M5000000 -o'#{@log_dir}/nmpeakseq_#{r}.b
     
     ENV['NMICA_JVMOPTS'] = "-Xmx5000m"
     
-    unless uptodate? "#{@peaks_dir}/#{inputf_basename}-#{method}-#{around_peaks}around-#{max_count}top.fasta", "#{@peaks_dir}/#{inputf_basename}.#{method}"
+    unless uptodate? peaks_seq_file, peaks_outputf 
       peakseq_cmd_was_run = true
       
       peakseq_input_cmd = peakseq_cmdline(inputf_basename,method,config,r,@log_dir,@peaks_dir)
-      #peakseq_control_cmd = peakseq_cmdline(controlf_basename,method,config,r,@log_dir,@peaks_dir)
-      $stderr.puts peakseq_input_cmd
-      #$stderr.puts peakseq_control_cmd
-      system(peakseq_input_cmd) unless test
-      #system(peakseq_control_cmd) unless test
+      sh peakseq_input_cmd
     else
       peakseq_cmd_was_run = false
-      $stderr.puts "Peak sequences for #{method} peak calls exist already" 
+      $stderr.puts "Peak sequences for %s peak calls exist already (%s)" % [method,peaks_seq_file] 
+    end
+  end
+
+  desc("Clean retrieved sequences")
+  task :clean_retrieved_sequences do 
+    if File.exist? peaks_seq_file
+      $stderr.puts "Removing #{peaks_seq_file}"
+      rm peaks_seq_file
+    else
+      $stderr.puts "#{peaks_seq_file} does not exist."
     end
   end
 
@@ -288,8 +384,8 @@ bsub -J'peakseq_#{r}' -R'#{resources}' -M5000000 -o'#{@log_dir}/nmpeakseq_#{r}.b
       jobdep = ""
     end
 
-    system("bsub -Jremove_checkpoints_#{r} -K -o/dev/null \"rm #{@checkpoints_dir}/*.jos\"")
-    system("bsub -Kremove_samples_#{r} -o/dev/null \"rm #{@motifs_dir}/*sample*.xms\"")
+    system("bsub -Jremove_checkpoints_#{r} -I \"rm #{@checkpoints_dir}/*.jos\"")
+    system("bsub -Jremove_samples_#{r} -I \"rm #{@motifs_dir}/*sample*.xms\"")
   end
  
   def tss_file
@@ -315,9 +411,9 @@ bsub -J'peakseq_#{r}' -R'#{resources}' -M5000000 -o'#{@log_dir}/nmpeakseq_#{r}.b
     downstr = tssconfig["downstream_nukes"]
 
     unless File.exists? tss_file
-      sh "nmensemblseq -format gff -fivePrimeUTR #{upstr} #{downstr} -known -proteinCoding -noRepeatMask -noExcludeTranslations -database #{@config['ref']} > #{tss_file}"
+      sh "bsub -Jretrieve_seqs_around_tss-#{r} -olog/retrieve_seqs_around_tss-#{r}.bsub -K \"nmensemblseq -format gff -fivePrimeUTR #{upstr} #{downstr} -known -proteinCoding -ignoreXrefless -noRepeatMask -noExcludeTranslations -database #{@config['ref']} > #{tss_file} 2> log/retrieve_seqs_around_tss-#{r}.err\""
     else
-      $stderr.puts "TSS sequences have already been fetched."
+      $stderr.puts "TSS sequences have already been fetched (%s)." % [tss_file]
     end
   end
 
@@ -328,14 +424,51 @@ bsub -J'peakseq_#{r}' -R'#{resources}' -M5000000 -o'#{@log_dir}/nmpeakseq_#{r}.b
     unless File.exists? regfeat_file
       sh "nmensemblregfeat -database #{@config['ref']} -format gff -host #{@config['ensembl_host']} -port #{@config['ensembl_port']} -user #{@config['ensembl_user']} > #{regfeat_file}"
     else
-      $stderr.puts "Regulatory features have already been fetched" 
+      $stderr.puts "Regulatory features have already been fetched (%s)" % [regfeat_file]
     end
   end
 
   desc("Combine the TSS sequence regions with the regulatory regions")
   task :combine_tss_with_regfeats => [:retrieve_seqs_around_tss, :retrieve_regfeats] do
-    sh "cat #{regfeat_file} #{tss_file} > #{tss_regfeat_combo_file}.tmp"
-    sh "nmcoveredseq -format gff -features #{tss_regfeat_combo_file}.tmp > #{tss_regfeat_combo_file}"
-    rm "#{tss_regfeat_combo_file}.tmp"
+    unless (uptodate?(tss_regfeat_combo_file,regfeat_file) and uptodate?(tss_regfeat_combo_file,tss_file))
+      sh "cat #{regfeat_file} #{tss_file} > #{tss_regfeat_combo_file}.tmp"
+      sh "nmcoveredseq -format gff -features #{tss_regfeat_combo_file}.tmp > #{tss_regfeat_combo_file}"
+      rm "#{tss_regfeat_combo_file}.tmp"
+    else
+    end
+  end
+
+  desc("Subselect peaks close to transcription start sites of known genes")
+  task :peaks_close_to_genes => [:retrieve_seqs_around_tss,:retrieve_sequences] do
+    unless (uptodate?(peaks_close_to_genes_gff_file,peaks_gff_file) and uptodate?(peaks_close_to_genes_gff_file,tss_file))
+      sh "bsub -olog/nmoverlapseq-#{r}.bsub -Jnmoverlapseq-#{r} -K \"nmoverlapseq -features #{peaks_gff_file} -mask #{tss_file} > #{peaks_close_to_genes_gff_file};\
+cat #{peaks_close_to_genes_gff_file} | gffaddensemblurl Mus_musculus > #{peaks_close_to_genes_html_file}\""
+    else
+      $stderr.puts "Peaks close to genes have already been calculated (%s)" % [peaks_close_to_genes_gff_file]
+    end
+  end
+
+  desc("Create and fill the conservation score database for a DAS data source")
+  task :fill_conservation_scores do
+    cconfig = @config["conservation_score_track"]
+    host = cconfig["host"]
+    user = cconfig["user"]
+    passwd = cconfig["password"]
+    port = cconfig["port"]
+    dbname = cconfig["database_name"]
+    input_file_pattern = File.join(cconfig["input_data_prefix"],"*.gz")
+    res_tiny="-R'select[type==X86_64 && mem>=2000] rusage[mem=2000]'"
+
+    sh "ngmkdepthdb -database #{dbname} -user #{user} -password #{passwd} -host #{host} -refLengths ref/#{@config['ref']}.len -dropDatabase -createDatabase" 
+    sh "bsub -qlong -o'log/conspileup-#{r}_%J-%I.bsub' #{res_tiny} -J'conspileup-#{r}-[1-#{ref_seq_count}]%8' \"ngconservation -database #{dbname} -user #{user} -password #{passwd} -host #{host} -refLengths ref/#{@config['ref']}.len -conservationScores #{input_file_pattern}\""
+  end
+
+  task :clean_peaks do
+    if File.exist? peaks_outputf
+      $stderr.puts "Removing %s" % [peaks_outputf]
+      rm peaks_outputf
+    else
+      $stderr.puts "Peak outputfile doesn't exist at %s" % [peaks_outputf]
+    end
   end
 end

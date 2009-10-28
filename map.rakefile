@@ -315,6 +315,7 @@ namespace :map do
     logf = "#{log_dir}/index_sorted_bam_#{r}.log"
     unless uptodate? outputf, inputf
       index_sorted_bam_cmd_was_run = true
+      NMICA_EXTRA_JVMOPTS="-Xmx4000m"
       index_sorted_bam_cmd = "bsub -J'index_sorted_bam_#{r}' #{jobdep} #{res} -o'#{log_dir}/index_sorted_bam_#{r}.bsub' \"samtools index #{inputf} #{outputf} > #{logf};ngcount -refLengths ref/#{ref_basename}.len -index #{outputf} -map #{inputf} > #{srt_path}.count\"; "
       $stderr.puts index_sorted_bam_cmd
       system(index_sorted_bam_cmd) unless test
@@ -325,14 +326,14 @@ namespace :map do
   end
 
   desc("Output a gzipped pileup of the mapped reads")
-  task :pileup => [:index_sorted_bam] do 
+  task :pileup => [:index_sorted_bam] do
     if index_sorted_bam_cmd_was_run
       jobdep = "-w'done(index_sorted_bam_#{r})'"
     else
       jobdep = ""
     end
 
-    unless uptodate? pileup_path, "#{srt_path}.bam"
+   unless uptodate? pileup_path, "#{srt_path}.bam"
       pileup_cmd_was_run = true
       pileup_cmd = "bsub -J'pileup_#{r}' #{jobdep} -o'#{log_dir}/pileup_#{r}.bsub' \"samtools pileup -cf #{ref_path} #{srt_path}.bam | gzip > #{pileup_path}\""
       $stderr.puts pileup_cmd
@@ -341,6 +342,10 @@ namespace :map do
       pileup_cmd_was_run = false
       $stderr.puts "Pileup file already exists for the map."
     end
+  end
+
+  def ref_seq_count
+    `wc -l ref/#{ref_basename}.len | cut -f 1 -d ' '`.to_i
   end
 
   desc("Export the sorted, indexed BAM data to a pileup database used in a DAS data source")
@@ -355,11 +360,11 @@ namespace :map do
     dasconfig = config["pileup_das_track"]
     unless uptodate? "#{srt_path}.daspileup","#{srt_path}.sam"
       daspileup_cmd_was_run = true
-      ref_seq_count = `wc -l ref/#{ref_basename}.len | cut -f 1 -d ' '`.to_i
-      mkdepthdb_cmd = "ngmkdepthdb -database #{dasconfig['database_name_prefix']}_#{reads_basename} -dropDatabase -createDatabase -host ens-research -user ensadmin -password ensembl -format mysql -refLengths ref/#{ref_basename}.len"  
+      dbname = "#{dasconfig['database_name_prefix']}_#{reads_basename}"
+      mkdepthdb_cmd = "bsub -olog/#{dbname}.bsub #{jobdep} -K \"ngmkdepthdb -database #{dbname} -dropDatabase -createDatabase -host ens-research -user ensadmin -password ensembl -format mysql -refLengths ref/#{ref_basename}.len -readCounts #{srt_path}.count\""  
       sh mkdepthdb_cmd 
       ENV["NMICA_EXTRA_JVMOPTS"] = "-Xmx2000m"
-      daspileup_cmd = "bsub -qlong -o'log/daspileup-#{r}_%J-%I.bsub' #{res_tiny} -J'daspileup-#{r}-[1-#{ref_seq_count}]%8' #{jobdep} \"ngdepth -windowFreq #{dasconfig['window_frequency']} -extendTo #{dasconfig['extended_length']} -host '#{dasconfig['host']}' -user #{dasconfig['user']} -password #{dasconfig['password']} -database #{dasconfig['database_name_prefix']}_#{reads_basename} -index #{srt_path}.bam.index -readCounts #{srt_path}.count -format mysql -refLengths ref/#{ref_basename}.len -map #{srt_path}.bam\""
+      daspileup_cmd = "bsub -qlong -o'log/daspileup-#{r}_%J-%I.bsub' #{res_tiny} -J'daspileup-#{r}-[1-#{ref_seq_count}]%4' \"ngdepth -windowFreq #{dasconfig['window_frequency']} -extendTo #{dasconfig['extended_length']} -host '#{dasconfig['host']}' -user #{dasconfig['user']} -password #{dasconfig['password']} -database #{dasconfig['database_name_prefix']}_#{reads_basename} -index #{srt_path}.bam.index -readCounts #{srt_path}.count -format mysql -refLengths ref/#{ref_basename}.len -map #{srt_path}.bam\""
       sh daspileup_cmd
     else
       daspileup_cmd_was_run = false
